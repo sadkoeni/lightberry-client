@@ -1,4 +1,9 @@
 import sys
+import os
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 # Conditional imports based on platform
 if sys.platform == "darwin":
@@ -21,7 +26,6 @@ from pydub import AudioSegment
 from io import BytesIO
 import threading
 import tempfile
-import os
 import queue
 import time
 from queue import Queue
@@ -305,7 +309,7 @@ elif sys.platform == "linux":
 
 
 
-def register_remote_device(device_auth, server_url):
+def register_remote_device(device_auth, server_url, admin_username, admin_password):
     """Register device with remote server using API endpoint"""
     try:
         # Extract server base URL from WebSocket URL
@@ -326,35 +330,118 @@ def register_remote_device(device_auth, server_url):
                 # Just has port
                 base_url = base_parts[0]
         
-        # Assume the registration endpoint
-        register_url = f"{base_url}:8000/api/register_device"
+        # First try the REST API endpoint if available
+        try:
+            # Use the same port as the WebSocket server
+            register_url = f"{base_url}/api/register_device"
+            
+            # Read public key
+            public_key_path = device_auth.keys_dir / 'public_key.pem'
+            with open(public_key_path, 'r') as f:
+                public_key = f.read()
+            
+            # Prepare registration data
+            data = {
+                'device_id': device_auth.device_id,
+                'public_key': public_key
+            }
+            
+            print(f"Attempting to register device with remote server at {register_url}")
+            
+            # Add timeout to the request and include basic auth
+            response = requests.post(
+                register_url, 
+                json=data, 
+                timeout=5,  # Use a shorter timeout
+                auth=(admin_username, admin_password)
+            )
+            
+            if response.status_code == 200:
+                print("Device registered successfully with remote server!")
+                return True
+            elif response.status_code == 401:
+                print("Authentication failed. Please check your admin credentials.")
+                return False
+            else:
+                print(f"Failed to register device: {response.text}")
+                # Fall through to websocket registration
+        except requests.exceptions.Timeout:
+            print("REST API registration request timed out.")
+            # Fall through to websocket registration
+        except requests.exceptions.ConnectionError:
+            print("Could not connect to REST API. Trying websocket registration...")
+            # Fall through to websocket registration
+        
+        # If REST API failed, try WebSocket registration as fallback
+        print("Attempting registration via WebSocket...")
+        return register_via_websocket(device_auth, server_url, admin_username, admin_password)
+            
+    except Exception as e:
+        print(f"Error in registration process: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+async def async_register_via_websocket(device_auth, server_url, admin_username, admin_password):
+    """Register device with remote server using WebSocket"""
+    try:
+        print(f"Connecting to WebSocket server at {server_url} for registration...")
         
         # Read public key
         public_key_path = device_auth.keys_dir / 'public_key.pem'
         with open(public_key_path, 'r') as f:
             public_key = f.read()
         
-        # Prepare registration data
-        data = {
-            'device_id': device_auth.device_id,
-            'public_key': public_key
-        }
-        
-        print(f"Attempting to register device with remote server at {register_url}")
-        response = requests.post(register_url, json=data)
-        
-        if response.status_code == 200:
-            print("Device registered successfully with remote server!")
-            return True
-        else:
-            print(f"Failed to register device: {response.text}")
-            return False
+        # Connect to WebSocket
+        async with websockets.connect(server_url) as websocket:
+            # Send registration message
+            registration_data = {
+                "type": "register_device",
+                "device_id": device_auth.device_id,
+                "public_key": public_key,
+                "admin_username": admin_username,
+                "admin_password": admin_password
+            }
+            
+            await websocket.send(json.dumps(registration_data))
+            
+            # Wait for response
+            try:
+                response = await asyncio.wait_for(websocket.recv(), timeout=5.0)
+                data = json.loads(response)
+                
+                if data.get("status") == "success":
+                    print("Device registered successfully via WebSocket!")
+                    return True
+                else:
+                    print(f"WebSocket registration failed: {data.get('message', 'Unknown error')}")
+                    return False
+                    
+            except asyncio.TimeoutError:
+                print("WebSocket registration timed out")
+                return False
+                
     except Exception as e:
-        print(f"Error registering with remote server: {e}")
+        print(f"WebSocket registration error: {e}")
         import traceback
         traceback.print_exc()
         return False
 
+def register_via_websocket(device_auth, server_url, admin_username, admin_password):
+    """Synchronous wrapper for async WebSocket registration"""
+    try:
+        import asyncio
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        result = loop.run_until_complete(
+            async_register_via_websocket(device_auth, server_url, admin_username, admin_password)
+        )
+        return result
+    except Exception as e:
+        print(f"Error in WebSocket registration wrapper: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
 
 def register_local_device(device_auth):
     """Register the local device in the database to bypass authentication"""
@@ -372,13 +459,20 @@ def register_local_device(device_auth):
                 print("Warning: Could not find server directory")
                 return False
         
-        # Import database module
+        # Import database module - try to import from device_database first
         try:
-            from database import init_db, Device
+            from device_database import init_db, Device
             from datetime import datetime
+            print("Successfully imported from device_database")
         except ImportError:
-            print("Warning: Could not import database module")
-            return False
+            try:
+                # Fallback to compatibility layer
+                from database import init_db, Device
+                from datetime import datetime
+                print("Successfully imported from compatibility layer (database)")
+            except ImportError:
+                print("Warning: Could not import database module")
+                return False
         
         # Initialize database
         db = init_db()
@@ -396,10 +490,16 @@ def register_local_device(device_auth):
             device.last_seen = datetime.utcnow()
         else:
             print(f"Registering new device {device_auth.device_id}...")
+            # Create with proper JSON settings object for the updated schema
             device = Device(
                 device_id=device_auth.device_id,
                 public_key=public_key,
-                settings='{"llm_provider": "openai", "model": "gpt-4"}',
+                settings={
+                    "llm_provider": "openai", 
+                    "model": "gpt-4",
+                    "voice_provider": "elevenlabs",
+                    "voice_id": "21m00Tcm4TlvDq8ikWAM"
+                },
                 last_seen=datetime.utcnow()
             )
             db.add(device)
@@ -478,11 +578,17 @@ class WakeWordDetector:
                 frame_length=self.porcupine.frame_length
             )
             
-            # List available audio devices
-            available_devices = PvRecorder.get_audio_devices()
+            # List available audio devices using sounddevice
+            devices = sd.query_devices()
             print("\nAvailable audio devices:")
-            for i, device in enumerate(available_devices):
-                print(f"Device {i}: {device}")
+            for i, device in enumerate(devices):
+                input_channels = device['max_input_channels']
+                output_channels = device['max_output_channels']
+                name = device['name']
+                if input_channels > 0:
+                    print(f"Input Device {i}: {name} (Inputs: {input_channels})")
+                if output_channels > 0:
+                    print(f"Output Device {i}: {name} (Outputs: {output_channels})")
             
             print("\nWake word detector initialized successfully")
             return True
@@ -549,6 +655,9 @@ class AudioRecorder:
         self.audio_player = AudioBuffer()
         self.manual_stop = False
         self.wake_word_path = wake_word_path  # Add wake word path
+        self.devices_shown = False  # Add flag to track if devices have been shown
+        self.enable_manual_stop = False  # Disable manual stop by default since silence detection is primary
+        self.current_stop_task = None  # Track current stop task
         
         # Debug mode flag and settings
         self.debug_mode = debug_mode
@@ -611,8 +720,12 @@ class AudioRecorder:
             
             print("Starting audio recording - please speak into the microphone...")
             print("Recording will stop automatically after silence or when you press Enter again.")
-            print("Available audio devices:")
-            list_audio_devices()  # Show available devices
+            
+            # Only show device list on first recording
+            if not self.devices_shown:
+                print("Available audio devices:")
+                list_audio_devices()  # Show available devices
+                self.devices_shown = True
             
             with sd.InputStream(
                 channels=self.channels,
@@ -852,86 +965,143 @@ class AudioRecorder:
                 print("\n" + "="*50)
                 print("AUDIO RECORDING CONTROL")
                 print("Say wake word to start recording")
-                print("Press ENTER again to stop recording manually")
-                print("Or wait for silence detection to stop automatically")
+                if self.enable_manual_stop:
+                    print("Press ENTER again to stop recording manually")
+                print("Recording will stop automatically after silence")
                 print("="*50 + "\n")
                 
                 try:
+                    session_count = 0
                     while True:
-                        # Wait for wake word instead of Enter key
-                        wake_word_detected = await detector.listen_for_wake_word()
-                        if not wake_word_detected:
-                            print("Wake word detection failed, falling back to Enter key")
-                            await wait_for_enter()
-                        
-                        print("Starting recording!")
-                        
-                        # Reset flags for new recording
-                        self.manual_stop = False
-                        
-                        # Start recording
-                        self.recording = True
-                        self.complete_audio = []
-                        self.queue = Queue()
-                        self.silence_detected = False
-                        
-                        # Start recording thread
-                        recording_thread = threading.Thread(target=self.record_audio_blocks)
-                        recording_thread.start()
-                        
-                        # Start a task to wait for Enter key to stop recording
-                        stop_task = asyncio.create_task(self.stop_recording_task())
-                        
-                        # Process audio chunks
-                        await self.process_queue()
-                        
-                        # Cancel stop task if it's still running
-                        if not stop_task.done():
-                            stop_task.cancel()
-                            try:
-                                await stop_task
-                            except asyncio.CancelledError:
-                                pass
-                        
-                        # Wait for response
-                        while True:
-                            try:
-                                response = await websocket.recv()
-                                data = json.loads(response)
-                                
-                                if data.get("status") == "text_response":
-                                    print(f"\nTranscription: {data.get('transcript')}")
-                                    print(f"Response: {data.get('response')}")
-                                
-                                elif data.get("status") == "stream_start":
-                                    print("\nReceiving audio response...")
-                                    # Clear the audio buffer for new response
-                                    self.audio_player.clear()
-                                
-                                elif data.get("status") == "stream_chunk":
-                                    # Process audio chunk
+                        try:
+                            # Check if websocket is still open before proceeding
+                            print(f"Session count: {session_count}")
+                            if session_count > 0:
+                                # Ensure connection is still alive
+                                try:
+                                    pong = await asyncio.wait_for(websocket.ping(), timeout=2.0)
+                                    await pong  # Confirms connection is working
+                                    print("Connection confirmed active")
+                                except (asyncio.TimeoutError, websockets.exceptions.ConnectionClosed) as e:
+                                    print(f"Connection error: {e}")
+                                    print("Reconnecting to server...")
+                                    # Try to reconnect
                                     try:
-                                        chunk_data = base64.b64decode(data["chunk"])
-                                        content_type = data.get("content_type", "audio/wav")
+                                        websocket = await websockets.connect(SERVER_URL)
+                                        self.websocket = websocket
                                         
-                                        # Add chunk to the buffer
-                                        self.audio_player.add_chunk(chunk_data, content_type)
-                                        
+                                        # Authenticate again
+                                        if not await authenticate_with_server(websocket, device_auth):
+                                            print("Re-authentication failed. Exiting.")
+                                            return
+                                            
+                                        # Restart heartbeat task
+                                        heartbeat_task.cancel()
+                                        try:
+                                            await heartbeat_task
+                                        except asyncio.CancelledError:
+                                            pass
+                                        heartbeat_task = asyncio.create_task(send_heartbeat(websocket))
+                                        print("Reconnected successfully!")
                                     except Exception as e:
-                                        print(f"Error processing audio chunk: {e}")
-                                        import traceback
-                                        traceback.print_exc()
-                                
-                                elif data.get("status") == "stream_end":
-                                    print("Finished receiving audio response, playing...")
-                                    # Play the combined audio
-                                    self.audio_player.combine_and_play()
-                                    print("\n>>> Recording session complete. Press ENTER to record again...")
+                                        print(f"Failed to reconnect: {e}")
+                                        return
+                            
+                            # Ensure any previous stop_task is properly cancelled
+                            if self.current_stop_task is not None:
+                                if not self.current_stop_task.done():
+                                    print("Cancelling previous stop task")
+                                    self.current_stop_task.cancel()
+                                    try:
+                                        await self.current_stop_task
+                                    except asyncio.CancelledError:
+                                        pass
+                                self.current_stop_task = None
+                            
+                            session_count += 1
+                            
+                            # Wait for wake word instead of Enter key
+                            wake_word_detected = await detector.listen_for_wake_word()
+                            if not wake_word_detected:
+                                print("Wake word detection failed, falling back to Enter key")
+                                await wait_for_enter()
+                            
+                            print("Starting recording!")
+                            
+                            # Reset flags for new recording
+                            self.manual_stop = False
+                            
+                            # Start recording
+                            self.recording = True
+                            self.complete_audio = []
+                            self.queue = Queue()
+                            self.silence_detected = False
+                            
+                            print("Starting recording thread")
+                            # Start recording thread
+                            recording_thread = threading.Thread(target=self.record_audio_blocks)
+                            recording_thread.start()
+                            
+                            # Start a task to wait for Enter key to stop recording (only if enabled)
+                            if self.enable_manual_stop:
+                                self.current_stop_task = asyncio.create_task(self.stop_recording_task())
+                            
+                            # Process audio chunks
+                            await self.process_queue()
+                            
+                            # Cancel stop task if it's still running
+                            if self.current_stop_task is not None and not self.current_stop_task.done():
+                                self.current_stop_task.cancel()
+                                try:
+                                    await self.current_stop_task
+                                except asyncio.CancelledError:
+                                    pass
+                            
+                            # Wait for response
+                            while True:
+                                try:
+                                    response = await websocket.recv()
+                                    data = json.loads(response)
+                                    
+                                    if data.get("status") == "text_response":
+                                        print(f"\nTranscription: {data.get('transcript')}")
+                                        print(f"Response: {data.get('response')}")
+                                    
+                                    elif data.get("status") == "stream_start":
+                                        print("\nReceiving audio response...")
+                                        # Clear the audio buffer for new response
+                                        self.audio_player.clear()
+                                    
+                                    elif data.get("status") == "stream_chunk":
+                                        # Process audio chunk
+                                        try:
+                                            chunk_data = base64.b64decode(data["chunk"])
+                                            content_type = data.get("content_type", "audio/wav")
+                                            
+                                            # Add chunk to the buffer
+                                            self.audio_player.add_chunk(chunk_data, content_type)
+                                            
+                                        except Exception as e:
+                                            print(f"Error processing audio chunk: {e}")
+                                            import traceback
+                                            traceback.print_exc()
+                                    
+                                    elif data.get("status") == "stream_end":
+                                        print("Finished receiving audio response, playing...")
+                                        # Play the combined audio
+                                        self.audio_player.combine_and_play()
+                                        print("\n>>> Recording session complete. Say wake word to record again...")
+                                        break
+                                    
+                                except websockets.exceptions.ConnectionClosed:
+                                    print("Connection closed by server during response")
+                                    await asyncio.sleep(1)
                                     break
-                                
-                            except websockets.exceptions.ConnectionClosed:
-                                print("Connection closed")
-                                break
+                        except Exception as e:
+                            print(f"Error in recording session: {e}")
+                            import traceback
+                            traceback.print_exc()
+                            await asyncio.sleep(1)
                 
                 finally:
                     # Cancel heartbeat task
@@ -1162,6 +1332,10 @@ def parse_args():
                         help='Register the device before connecting')
     parser.add_argument('--wake-word', type=str,
                        help='Path to custom wake word model file')
+    parser.add_argument('--admin-user', type=str, default='admin',
+                       help='Admin username for device registration')
+    parser.add_argument('--admin-password', type=str,
+                       help='Admin password for device registration')
     return parser.parse_args()
 
 # Main function
@@ -1185,6 +1359,42 @@ if __name__ == "__main__":
             os.execv(sys.executable, [sys.executable] + sys.argv)
     
     try:
+        # Initialize device authentication
+        device_auth = DeviceAuth()
+        print(f"\nDevice ID: {device_auth.device_id}")
+        
+        # Register device if needed
+        if args.register or args.local:
+            print("\nRegistering device...")
+            if args.local:
+                success = register_local_device(device_auth)
+            else:
+                if not args.admin_password:
+                    print("Error: --admin-password is required for remote registration")
+                    sys.exit(1)
+                    
+                server_url = f"ws://{args.server}:{args.port}"
+                print(f"Attempting to register with server: {server_url}")
+                success = register_remote_device(
+                    device_auth, 
+                    server_url,
+                    args.admin_user,
+                    args.admin_password
+                )
+            
+            if not success:
+                print("\nWarning: Device registration failed.")
+                if not args.local:
+                    print("Please check that:")
+                    print("1. The server is running")
+                    print("2. The server URL is correct")
+                    print("3. The admin credentials are correct")
+                print("\nContinuing anyway...")
+            else:
+                print("\nDevice registration successful!")
+        
+        # Run the main audio processing loop
+        print("\nStarting audio processing...")
         asyncio.run(record_and_process(
             debug_mode=args.debug,
             test_audio_dir=args.test_dir,
@@ -1192,10 +1402,8 @@ if __name__ == "__main__":
             wake_word_path=args.wake_word
         ))
     except KeyboardInterrupt:
-        print("\nApplication terminated by user (Ctrl+C)")
+        print("\nShutting down gracefully...")
     except Exception as e:
-        print(f"\nApplication error: {e}")
+        print(f"\nError: {e}")
         import traceback
         traceback.print_exc()
-        
-    print("\nAudio client shutdown complete.")
