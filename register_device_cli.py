@@ -122,7 +122,7 @@ def register_device_as_user(registration_data, server_url, token):
             return False
             
         # Devices endpoint
-        register_url = f"{base_url}/devices"
+        register_url = f"{base_url}/api/devices"
         
         print(f"Registering device with server at {register_url}")
         
