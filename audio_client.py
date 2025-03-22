@@ -9,7 +9,8 @@ load_dotenv()
 if sys.platform == "darwin":
     import requests
 elif sys.platform == "linux":
-    import RPi.GPIO as GPIO
+    # Removing GPIO import since we won't be using the button functionality
+    pass
 
 import pyaudio
 import wave
@@ -47,7 +48,7 @@ FORMAT = pyaudio.paFloat32
 CHANNELS = 1
 RATE = 16000
 RECORD_SECONDS = 5
-SILENCE_THRESHOLD = 0.01  # Using lower threshold to capture more audio
+SILENCE_THRESHOLD = 0.3  # Updated from 0.01 to 0.3 as requested
 SILENCE_DURATION = 1.2
 SILENCE_CHUNKS = int(SILENCE_DURATION * RATE / CHUNK)
 GOODBYE_PHRASES = ["goodbye", "bye", "exit", "quit", "stop"]
@@ -60,13 +61,13 @@ HEARTBEAT_INTERVAL = 5
 PICOVOICE_ACCESS_KEY = os.environ.get('PICOVOICE_API_KEY', '')  # Add this to your .env file
 
 # Server details
-SERVER_IP = os.environ.get('AUDIO_SERVER_IP', 'localhost' if sys.platform == "darwin" else 'MacBook-Pro.local')
+#SERVER_IP = os.environ.get('AUDIO_SERVER_IP', 'localhost' if sys.platform == "darwin" else 'MacBook-Pro.local')
+SERVER_IP = "34.116.196.182"
 SERVER_PORT = int(os.environ.get('AUDIO_SERVER_PORT', '8765'))
 SERVER_URL = f"ws://{SERVER_IP}:{SERVER_PORT}"
 
 # Platform-specific constants
 if sys.platform == "linux":
-    BUTTON_PIN = 27
     os.environ['AUDIODRIVER'] = 'pulse'
 
 # Common functions and classes
@@ -247,65 +248,8 @@ if sys.platform == "darwin":
             self.py_audio.terminate()
 
 elif sys.platform == "linux":
-    class ButtonMonitor:
-        def __init__(self, pin=BUTTON_PIN):
-            self.pin = pin
-            self.setup_complete = False
-            self.last_press_time = 0
-            self.setup()
-        
-        def setup(self):
-            try:
-                GPIO.setwarnings(False)
-                GPIO.setmode(GPIO.BCM)
-                GPIO.setup(self.pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-                self.setup_complete = True
-                print(f"GPIO setup complete. Monitoring button on pin {self.pin}")
-            except Exception as e:
-                print(f"GPIO setup error: {e}")
-                self.setup_complete = False
-        
-        def check_button_state(self):
-            """Check if button is pressed with debouncing"""
-            if not self.setup_complete:
-                return False
-            
-            current_time = time.time()
-            if current_time - self.last_press_time < 0.3:
-                return False
-            
-            if GPIO.input(self.pin) == GPIO.LOW:
-                self.last_press_time = current_time
-                return True
-            return False
-        
-        def cleanup(self):
-            if self.setup_complete:
-                try:
-                    GPIO.cleanup()
-                    print("GPIO cleanup completed")
-                except Exception as e:
-                    print(f"GPIO cleanup error: {e}")
-
-        async def wait_for_button_press(self):
-            """Async function to wait for button press"""
-            if not self.setup_complete:
-                print("GPIO not set up properly. Falling back to Enter key.")
-                await wait_for_enter()
-                return
-                
-            print("Waiting for button press to start recording...")
-            loop = asyncio.get_event_loop()
-            
-            def check_button():
-                while True:
-                    if self.check_button_state():
-                        print("Button pressed!")
-                        return True
-                    time.sleep(0.1)
-            
-            await loop.run_in_executor(None, check_button)
-            await asyncio.sleep(0.3)  # Debounce delay
+    # Removing ButtonMonitor class as requested - we'll use wake word detection instead
+    pass  # We'll use the same wake word functionality for Linux as for Mac
 
 
 
@@ -1020,7 +964,7 @@ class AudioRecorder:
                             
                             session_count += 1
                             
-                            # Wait for wake word instead of Enter key
+                            # Always use wake word detection regardless of platform
                             wake_word_detected = await detector.listen_for_wake_word()
                             if not wake_word_detected:
                                 print("Wake word detection failed, falling back to Enter key")
@@ -1373,7 +1317,7 @@ if __name__ == "__main__":
                     print("Error: --admin-password is required for remote registration")
                     sys.exit(1)
                     
-                server_url = f"ws://{args.server}:{args.port}"
+                server_url = f"wss://{args.server}"
                 print(f"Attempting to register with server: {server_url}")
                 success = register_remote_device(
                     device_auth, 
