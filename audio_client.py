@@ -42,6 +42,8 @@ from pvrecorder import PvRecorder
 import platform
 import struct
 import socket  # Add socket module for IPC
+import shutil
+import subprocess
 
 # Constants
 CHUNK = 1024
@@ -1510,31 +1512,67 @@ class AudioBuffer:
     
     def combine_and_play(self):
         """Combine all chunks and play the audio"""
-        if not self.chunks:
-            print("No audio chunks to play")
-            return
-        
-        try:
-            # Determine file extension based on content type
-            extension = '.mp3' if self.content_type == 'audio/mpeg' else '.wav'
-            
-            # Create a combined file
-            self.combined_file = os.path.join(self.temp_dir, f"combined{extension}")
-            
-            # Write all chunks to the file
-            with open(self.combined_file, 'wb') as f:
+        # Check if we're on a Raspberry Pi or Linux system
+        if platform.system() == "Linux":
+            # Create a temporary file for the combined audio
+            with tempfile.NamedTemporaryFile(suffix='.mp3', delete=False) as temp_file:
+                temp_path = temp_file.name
+                
+                # Write all chunks to the temp file
                 for chunk in self.chunks:
-                    f.write(chunk)
-            
-            print(f"Combined {len(self.chunks)} chunks into {self.combined_file}")
-            
-            # Play the combined file
-            self.play_file(self.combined_file)
-            
-        except Exception as e:
-            print(f"Error combining and playing audio: {e}")
-            import traceback
-            traceback.print_exc()
+                    temp_file.write(chunk)
+                
+                # Close the file to ensure data is flushed
+                temp_file.flush()
+                
+                print(f"Combined {len(self.chunks)} chunks into {temp_path}")
+                
+                try:
+                    # Use a proper MP3 player on Linux - try mpg123 first, then others
+                    if shutil.which('mpg123'):
+                        subprocess.run(['mpg123', temp_path], check=True)
+                        print("Played audio using mpg123")
+                    elif shutil.which('mplayer'):
+                        subprocess.run(['mplayer', temp_path], check=True)
+                        print("Played audio using mplayer")
+                    else:
+                        # If no MP3 player is available, try converting to WAV for aplay
+                        wav_path = temp_path.replace('.mp3', '.wav')
+                        try:
+                            # Try using ffmpeg to convert if available
+                            if shutil.which('ffmpeg'):
+                                subprocess.run(['ffmpeg', '-i', temp_path, wav_path], 
+                                              check=True, stdout=subprocess.DEVNULL, 
+                                              stderr=subprocess.DEVNULL)
+                                subprocess.run(['aplay', wav_path], check=True)
+                                print("Played audio using ffmpeg conversion and aplay")
+                            else:
+                                print("Error: Cannot play MP3 audio. Please install mpg123, mplayer, or ffmpeg")
+                        except Exception as e:
+                            print(f"Error converting or playing audio: {e}")
+                except Exception as e:
+                    print(f"Error playing audio: {e}")
+            finally:
+                # Clean up temp files
+                try:
+                    os.unlink(temp_path)
+                    if 'wav_path' in locals() and os.path.exists(wav_path):
+                        os.unlink(wav_path)
+                except:
+                    pass
+        else:
+            # Original Mac implementation
+            with tempfile.TemporaryDirectory() as temp_dir:
+                temp_path = os.path.join(temp_dir, 'combined.mp3')
+                with open(temp_path, 'wb') as f:
+                    for chunk in self.chunks:
+                        f.write(chunk)
+                print(f"Combined {len(self.chunks)} chunks into {temp_path}")
+                subprocess.run(['afplay', temp_path], check=True)
+                print("Played audio using afplay")
+        
+        # Clear chunks after playing
+        self.chunks = []
     
     def play_file(self, file_path):
         """Play an audio file using the system's audio player"""
