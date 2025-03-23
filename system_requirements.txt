@@ -1,0 +1,11 @@
+# System requirements for Linux/Raspberry Pi
+# These packages need to be installed via apt-get
+
+# Audio playback and processing
+mplayer
+ffmpeg
+python3-pyaudio
+
+# Additional system dependencies
+portaudio19-dev  # Required for PyAudio
+python3-dev      # Required for building some Python packages 

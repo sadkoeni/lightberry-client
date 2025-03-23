@@ -12,7 +12,10 @@ pvporcupine>=2.1.0
 pvrecorder>=1.1.1
 python-dotenv>=0.21.0
 pyaudio>=0.2.11
+pynput>=1.7.6  # For macOS keyboard control
 
-# Platform-specific dependencies (commented out for cross-platform compatibility)
+# Platform-specific dependencies:
 # For macOS: pip install pynput
-# For Raspberry Pi: apt-get install python3-pyaudio 
+# For Linux/Raspberry Pi: 
+#   sudo apt-get update
+#   sudo apt-get install -y mplayer ffmpeg python3-pyaudio 
