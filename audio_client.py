@@ -51,7 +51,7 @@ FORMAT = pyaudio.paFloat32
 CHANNELS = 1
 RATE = 16000
 RECORD_SECONDS = 5
-SILENCE_THRESHOLD = 0.3  # Updated from 0.01 to 0.3 as requested
+SILENCE_THRESHOLD = 0.25  # Updated from 0.01 to 0.3 as requested
 SILENCE_DURATION = 1.2
 SILENCE_CHUNKS = int(SILENCE_DURATION * RATE / CHUNK)
 GOODBYE_PHRASES = ["goodbye", "bye", "exit", "quit", "stop"]
@@ -812,7 +812,7 @@ class WakeWordDetector:
             self.porcupine.delete()
 
 class AudioRecorder:
-    def __init__(self, debug_mode=False, test_audio_dir='test_audio', local_mode=False, wake_word_path=None, function_mode=False):
+    def __init__(self, debug_mode=False, test_audio_dir='test_audio', local_mode=False, wake_word_path=None, function_mode=False, continue_convo=0):
         self.recording = False
         self.audio_buffer = []
         self.silence_counter = 0
@@ -833,6 +833,11 @@ class AudioRecorder:
         self.function_handler = None  # Will be initialized in record_and_process
         self.last_activity_time = time.time()  # Track last activity time for timeout
         self.wake_timeout = 10  # Timeout in seconds for wake word detection
+        
+        # Add continue conversation settings
+        self.continue_convo = continue_convo
+        self.convo_attempt_counter = 0
+        self.in_conversation = False
         
         # Debug mode flag and settings
         self.debug_mode = debug_mode
@@ -1247,6 +1252,8 @@ class AudioRecorder:
                 if self.enable_manual_stop:
                     print("Press ENTER again to stop recording manually")
                 print("Recording will stop automatically after silence")
+                if self.continue_convo > 0:
+                    print(f"Will continue conversation up to {self.continue_convo} times without wake word")
                 print("="*50 + "\n")
                 
                 try:
@@ -1299,52 +1306,71 @@ class AudioRecorder:
                             
                             session_count += 1
                             
-                            # Function mode with dual waiting - wait for either wake word or function call
-                            if self.function_mode:
-                                print("Waiting for function call or wake word...")
-                                # Create tasks for both wake word and function call
-                                wake_word_task = asyncio.create_task(detector.listen_for_wake_word())
-                                function_call_task = asyncio.create_task(self.function_handler.wait_for_function_call())
+                            # Check if we're continuing a conversation or starting a new one
+                            if self.in_conversation and self.convo_attempt_counter < self.continue_convo:
+                                print(f"Continuing conversation (attempt {self.convo_attempt_counter + 1}/{self.continue_convo})")
+                                self.convo_attempt_counter += 1
                                 
-                                # Wait for either task to complete
-                                done, pending = await asyncio.wait(
-                                    [wake_word_task, function_call_task],
-                                    return_when=asyncio.FIRST_COMPLETED
-                                )
+                                # Add a small delay before starting to record again
+                                print("Adding a small pause before continuing...")
+                                await asyncio.sleep(0.2)
                                 
-                                # Cancel the pending task
-                                for task in pending:
-                                    task.cancel()
-                                    try:
-                                        await task
-                                    except asyncio.CancelledError:
-                                        pass
-                                
-                                # Determine which task completed
-                                wake_word_detected = False
-                                function_call_detected = False
-                                
-                                for task in done:
-                                    if task == wake_word_task:
-                                        wake_word_detected = task.result()
-                                        if wake_word_detected:
-                                            print("Wake word detected!")
-                                    elif task == function_call_task:
-                                        function_call_detected = task.result()
-                                        if function_call_detected:
-                                            print("Function call processed!")
-                                
-                                if not (wake_word_detected or function_call_detected):
-                                    print("Neither wake word nor function call detected, falling back to Enter key")
-                                    await wait_for_enter()
+                                print("Starting recording without wake word...")
+                                wake_word_detected = True  # Skip wake word detection
                             else:
-                                # Always use wake word detection regardless of platform
-                                wake_word_detected = await detector.listen_for_wake_word()
-                                if not wake_word_detected:
-                                    print("Wake word detection failed, falling back to Enter key")
-                                    await wait_for_enter()
+                                # Reset conversation state for a new conversation
+                                self.in_conversation = False
+                                self.convo_attempt_counter = 0
+                                
+                                # Function mode with dual waiting - wait for either wake word or function call
+                                if self.function_mode:
+                                    print("Waiting for function call or wake word...")
+                                    # Create tasks for both wake word and function call
+                                    wake_word_task = asyncio.create_task(detector.listen_for_wake_word())
+                                    function_call_task = asyncio.create_task(self.function_handler.wait_for_function_call())
+                                    
+                                    # Wait for either task to complete
+                                    done, pending = await asyncio.wait(
+                                        [wake_word_task, function_call_task],
+                                        return_when=asyncio.FIRST_COMPLETED
+                                    )
+                                    
+                                    # Cancel the pending task
+                                    for task in pending:
+                                        task.cancel()
+                                        try:
+                                            await task
+                                        except asyncio.CancelledError:
+                                            pass
+                                    
+                                    # Determine which task completed
+                                    wake_word_detected = False
+                                    function_call_detected = False
+                                    
+                                    for task in done:
+                                        if task == wake_word_task:
+                                            wake_word_detected = task.result()
+                                            if wake_word_detected:
+                                                print("Wake word detected!")
+                                        elif task == function_call_task:
+                                            function_call_detected = task.result()
+                                            if function_call_detected:
+                                                print("Function call processed!")
+                                    
+                                    if not (wake_word_detected or function_call_detected):
+                                        print("Neither wake word nor function call detected, falling back to Enter key")
+                                        await wait_for_enter()
+                                else:
+                                    # Always use wake word detection regardless of platform
+                                    wake_word_detected = await detector.listen_for_wake_word()
+                                    if not wake_word_detected:
+                                        print("Wake word detection failed, falling back to Enter key")
+                                        await wait_for_enter()
                             
                             print("Starting recording!")
+                            
+                            # Mark as in conversation when starting a new recording
+                            self.in_conversation = True
                             
                             # Reset flags for new recording
                             self.manual_stop = False
@@ -1411,6 +1437,8 @@ class AudioRecorder:
                                         if contains_goodbye(transcript):
                                             goodbye_detected = True
                                             print("Goodbye phrase detected, will return to wait mode after playback")
+                                            # Reset conversation state
+                                            self.in_conversation = False
                                     
                                     elif data.get("status") == "stream_start":
                                         print("\nReceiving audio response...")
@@ -1442,11 +1470,16 @@ class AudioRecorder:
                                         # Mark as received full response
                                         response_received = True
                                         
-                                        # Check for goodbye or function mode
-                                        if self.function_mode and (goodbye_detected or self.function_handler.check_timeout()):
-                                            print("\n>>> Returning to function call/wake word wait mode...")
+                                        # Check if we're continuing the conversation or going back to wait mode
+                                        if goodbye_detected or (self.function_mode and self.function_handler.check_timeout()):
+                                            self.in_conversation = False
+                                            print("\n>>> Returning to wait mode...")
+                                        elif not self.in_conversation or self.convo_attempt_counter >= self.continue_convo:
+                                            # We've reached the max continue attempts or already determined not to continue
+                                            self.in_conversation = False
+                                            print("\n>>> Returning to wait mode. Say wake word to start again...")
                                         else:
-                                            print("\n>>> Recording session complete. Say wake word to record again...")
+                                            print(f"\n>>> Continuing conversation ({self.convo_attempt_counter}/{self.continue_convo}). Speak without wake word...")
                                         break
                                     
                                     elif data.get("status") == "error":
@@ -1918,12 +1951,12 @@ class SocketServer:
         self.server_thread = None
         print("Socket server stopped completely")
 
-async def record_and_process(debug_mode=False, test_audio_dir='test_audio', local_mode=False, wake_word_path=None, function_mode=False):
+async def record_and_process(debug_mode=False, test_audio_dir='test_audio', local_mode=False, wake_word_path=None, function_mode=False, continue_convo=0):
     """Global function to create and run the AudioRecorder"""
     global function_call_recorder, socket_server_instance
     
     recorder = AudioRecorder(debug_mode=debug_mode, test_audio_dir=test_audio_dir, local_mode=local_mode, 
-                           wake_word_path=wake_word_path, function_mode=function_mode)
+                           wake_word_path=wake_word_path, function_mode=function_mode, continue_convo=continue_convo)
     
     # If in function mode, store the recorder globally for external access
     if function_mode:
@@ -1998,6 +2031,8 @@ def parse_args():
                        help='Admin password for device registration')
     parser.add_argument('--function-start', action='store_true',
                         help='Wait for external function call with WAV file instead of wake word')
+    parser.add_argument('--continue-convo', type=int, default=0,
+                        help='Number of times to continue conversation without requiring wake word')
     return parser.parse_args()
 
 # Main function
@@ -2066,7 +2101,8 @@ if __name__ == "__main__":
                 test_audio_dir=args.test_dir,
                 local_mode=args.local,
                 wake_word_path=args.wake_word,
-                function_mode=True
+                function_mode=True,
+                continue_convo=args.continue_convo
             ))
         else:
             # Regular mode
@@ -2075,7 +2111,8 @@ if __name__ == "__main__":
                 test_audio_dir=args.test_dir,
                 local_mode=args.local,
                 wake_word_path=args.wake_word,
-                function_mode=False
+                function_mode=False,
+                continue_convo=args.continue_convo
             ))
     except KeyboardInterrupt:
         print("\nShutting down gracefully...")
