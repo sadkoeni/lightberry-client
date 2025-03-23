@@ -1552,14 +1552,14 @@ class AudioBuffer:
                             print(f"Error converting or playing audio: {e}")
                 except Exception as e:
                     print(f"Error playing audio: {e}")
-            finally:
+                
                 # Clean up temp files
                 try:
                     os.unlink(temp_path)
                     if 'wav_path' in locals() and os.path.exists(wav_path):
                         os.unlink(wav_path)
-                except:
-                    pass
+                except Exception as e:
+                    print(f"Error cleaning up temporary files: {e}")
         else:
             # Original Mac implementation
             with tempfile.TemporaryDirectory() as temp_dir:
